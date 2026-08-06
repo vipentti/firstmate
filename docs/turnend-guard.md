@@ -50,12 +50,8 @@ If `jq` is missing or hook stdin is empty, the guard exits 0 because it cannot s
 - Grok registers a `Stop` hook in `.grok/hooks/fm-primary-turnend-guard.json` and delegates capability selection to `bin/fm-turnend-guard-grok.sh`.
   The tracked Claude Stop entries are inert when `GROK_AGENT` is present, so Grok's Claude-compatible settings loading cannot create a second continuation path.
 - Cursor registers a `stop` hook in `.cursor/hooks.json` (project-root, tracked), anchored through `CURSOR_PROJECT_DIR`, delegating to `bin/fm-turnend-guard-cursor.sh`.
-  Cursor's stop hook does not honour exit 2 as a forced continuation, so on a blind turn the shim foregrounds the arm in the hook-owned tree, re-runs the shared guard, and emits a normal wake follow-up when the arm reports a typed actionable close while the need remains.
-  An arm failure or untyped close keeps the loud registration and startup failure follow-up, while a healthy watcher or vanished need emits `{}`.
-  Like `--claude` mode, the shim does not let a continuation short-circuit the predicate: a `loop_count > 0` follow-up turn that ends blind re-arms.
-  The shim bounds the chain itself with separate session-scoped records under `state/` - consecutive arm-failure follow-ups (`FM_CURSOR_TURNEND_BLOCK_BUDGET`, default 3) and consecutive repeats of the same canonical wake reason (`FM_CURSOR_WAKE_CHAIN_BUDGET`, default 5, plus one diagnostic follow-up at the ceiling, which also clears the record) - while distinct wake reasons count as progress, repeated reasons and failures advance one persistent total, and both branch counters reset each other.
-  Allowed stops, non-continuation stops (`loop_count` 0), and session mismatches clear the record; a positive payload `loop_count` is only fallback when persistence fails, while absent or malformed values retain persistent state or fail closed with a loud diagnostic.
-  Over both sits one unified hard bound: alternating actionable and failed closes cannot evade the sum of the two budgets, and the ceiling emits a diagnostic follow-up rather than `{}`.
+  The shim owns the hook-local foreground arm and emits a normal drain-and-handle follow-up for typed actionable closes, while arm failures retain loud registration and startup guidance.
+  The exact Cursor wake handling, continuation bounds, and primary/secondmate applicability live in [`supervision-protocols/cursor.md`](supervision-protocols/cursor.md).
   The same file registers a `preToolUse` hook with a `Shell` matcher running `bin/fm-arm-pretool-check.sh --cursor`.
   Verified against cursor-agent 2026.07.23-e383d2b; the top-level `"version": 1` key is load-bearing (without it cursor silently discards the file and every hook is inert).
 
