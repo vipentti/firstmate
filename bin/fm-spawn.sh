@@ -217,6 +217,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
+# shellcheck source=bin/fm-cursor-lib.sh
+. "$SCRIPT_DIR/fm-cursor-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -614,9 +616,6 @@ if [ "$BACKEND" = cmux ] && [ "$KIND" = secondmate ]; then
   echo "error: backend=cmux does not support --secondmate spawns yet" >&2
   exit 1
 fi
-if [ "$BACKEND" = orca ]; then
-  fm_backend_orca_runtime_check || exit 1
-fi
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
@@ -896,6 +895,9 @@ launch_template() {
 case "$ARG3" in
   *' '*)  # raw launch command (unverified-adapter escape hatch)
     LAUNCH=$ARG3
+    # The escape hatch is passed through byte-identically: firstmate does not
+    # know what this command is, so it adds no wrapper of its own.
+    RAW_LAUNCH=1
     HARNESS=""
     for word in $LAUNCH; do
       case "$word" in [A-Za-z_]*=*) continue ;; *) HARNESS=$(basename "$word"); break ;; esac
@@ -942,6 +944,32 @@ esac
 if [ "$KIND" = secondmate ] && [ "$HARNESS" = muse ]; then
   echo "error: muse is a verified crewmate/scout adapter only and cannot run a secondmate; it has no primary supervision protocol. Select a harness verified for secondmates." >&2
   exit 1
+fi
+
+# Cursor launches a background worker-server that detaches from the pane and
+# leaves the task worktree, so teardown can only reap it by the pid identity
+# recorded at spawn (cursor_worker_server_record below). That discovery reads
+# the pane's own process tree, which only the tmux and herdr backends expose.
+# On any other backend the record would be silently omitted and the detached
+# worker-server would leak, so refuse here - before an endpoint is created, a
+# launch command is delivered, or task metadata is published - rather than
+# spawning a task whose cleanup is known to be incomplete.
+if [ "$HARNESS" = cursor ]; then
+  case "$BACKEND" in
+    tmux|herdr) ;;
+    *)
+      echo "error: cursor cannot spawn on backend=$BACKEND: this backend does not expose the pane process tree, so the detached worker-server cannot be discovered and would leak after cleanup. Cursor is supported on backends: tmux, herdr." >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# Probed after the harness/backend refusals above: an impossible combination is
+# a configuration error the operator can fix without a healthy runtime, so it
+# should not be reported as a runtime failure of the backend it can never use.
+# Still well before any endpoint, worktree, launch command, or metadata exists.
+if [ "$BACKEND" = orca ]; then
+  fm_backend_orca_runtime_check || exit 1
 fi
 
 # pi-signed is an explicitly selected executable identity, not an alias that may
@@ -1057,38 +1085,11 @@ muse_credential_present() {
   [ -s "$auth" ] || muse_worker_meta_api_key_present
 }
 
-resolve_cursor_binary() {
-  local candidate dir name fallback
-  # cursor-agent is the primary name; `agent` is the legacy alias cursor
-  # ships on every platform and a FALLBACK ONLY - the name is too generic to
-  # trust as the primary pick when something else on PATH could shadow it.
-  # Known Unix install locations ($HOME/.local/bin) cover non-interactive
-  # shells whose PATH omits the user's local bin directory.
-  for name in cursor-agent agent; do
-    candidate=$(command -v "$name" 2>/dev/null || true)
-    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-      case "$candidate" in
-        /*) printf '%s\n' "$candidate"; return 0 ;;
-        *)
-          dir=$(cd "$(dirname "$candidate")" 2>/dev/null && pwd -P) || dir=
-          if [ -n "$dir" ]; then
-            printf '%s/%s\n' "$dir" "$(basename "$candidate")"
-            return 0
-          fi
-          ;;
-      esac
-    fi
-  done
-  for name in cursor-agent agent; do
-    fallback="${HOME:-}/.local/bin/$name"
-    if [ -n "${HOME:-}" ] && [ -x "$fallback" ]; then
-      printf '%s\n' "$fallback"
-      return 0
-    fi
-  done
-  echo "error: cursor executable not found; searched PATH for 'cursor-agent' and 'agent', plus fallbacks '$HOME/.local/bin/cursor-agent' and '$HOME/.local/bin/agent'" >&2
-  return 1
-}
+# Resolution order, the legacy-alias proof, and the diagnostic all live in
+# fm_cursor_resolve_binary (bin/fm-cursor-lib.sh), which bin/fm-remote-doctor.sh
+# reproduces so a readiness check and a spawn never disagree about what counts
+# as Cursor.
+resolve_cursor_binary() { fm_cursor_resolve_binary; }
 
 model_flag_for_harness() {
   local harness=$1 model=$2
@@ -1842,14 +1843,22 @@ kimi_capture() {
 # detach. No match is not fatal: teardown falls back to its cwd-based reaper.
 # Never matched by a generic worker-server cmdline scan - the install dir and
 # cmdline are shared across homes and tasks.
+# True when the process whose full argument string is $1 is the Cursor CLI
+# launched from the exact resolved executable $2.
+#
+# Two conditions, both required. The process must satisfy the narrowed Cursor
+# identity rule owned by bin/fm-cursor-lib.sh, and its argv[0] must resolve to
+# the SAME canonical executable this spawn selected - binding the exact
+# resolved path, never the basename, so a second Cursor install or an unrelated
+# executable sharing the alias name cannot capture this task's worker-server
+# discovery.
 cursor_process_matches() {  # <args> <cursor-binary>
-  local args=$1 binary=$2 name
-  name=${binary##*/}
-  case "$name" in cursor-agent|agent) ;; *) return 1 ;; esac
-  case "$args" in
-    "$name"|"$name "*|*/"$name"|*/"$name "*) return 0 ;;
-  esac
-  return 1
+  local args=$1 binary=$2 argv0
+  [ -n "$args" ] || return 1
+  fm_cursor_process_matches "${args%% *}" "$args" || return 1
+  argv0=${args%% *}
+  [ -n "$argv0" ] || return 1
+  [ "$(fm_cursor_canonical_path "$argv0")" = "$(fm_cursor_canonical_path "$binary")" ]
 }
 
 cursor_worker_server_find() {  # <backend> <target> <cursor-binary> -> pid on stdout
@@ -1880,22 +1889,11 @@ cursor_worker_server_find() {  # <backend> <target> <cursor-binary> -> pid on st
   esac
 }
 
+# The recorded identity is produced by the SAME parse teardown re-checks
+# (fm_process_identity, bin/fm-cursor-lib.sh), so a comm containing spaces
+# cannot make the two disagree and silently defeat the recycled-pid check.
 cursor_worker_server_identity() {  # <pid> -> identity value for meta
-  local pid=$1 proc_root stat_line starttime value
-  proc_root=${FM_PROC_ROOT_OVERRIDE:-/proc}
-  if [ -r "$proc_root/$pid/stat" ]; then
-    stat_line=$(cat "$proc_root/$pid/stat" 2>/dev/null) || return 1
-    starttime=$(awk '{print $22}' <<< "$stat_line")
-    case "$starttime" in ''|*[!0-9]*) return 1 ;; esac
-    printf '%s\n' "$starttime"
-    return 0
-  fi
-  value=$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null) || return 1
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  [ -n "$value" ] || return 1
-  case "$value" in *$'\n'*|*$'\r'*) return 1 ;; esac
-  printf 'lstart=%s\n' "$value"
+  fm_process_identity "$1"
 }
 
 cursor_worker_server_record() {  # <backend> <target> <meta>
@@ -2428,9 +2426,17 @@ if [ "$KIND" = secondmate ]; then
   # injected carrier and this on/off snapshot are guaranteed to agree.
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_PUBLIC_FOLLOWUP_PRIMARY_HOME=$sq_primary_home FM_HOME=$sq_home FM_TRACE_CONTEXT=$SPAWN_TRACE_EFFECTIVE FM_SUPERVISION_MODEL=$supervision_model $LAUNCH"
 fi
-case "$HARNESS" in
-  claude|codex|opencode|pi|pi-signed|grok|kimi) LAUNCH="env -u CURSOR_AGENT $LAUNCH" ;;
-esac
+# One launch-boundary rule, no per-template exceptions: every TEMPLATE-built
+# worker that is NOT cursor starts without cursor-agent's CURSOR_AGENT=1
+# identity marker. The raw-command escape hatch is excluded because it is
+# passed through byte-identically by contract.
+# fm-harness.sh checks that marker before every other signal, so a marker
+# inherited from a cursor primary would make any markerless harness - codex,
+# opencode, kimi, muse - detect itself as cursor. Stating it as a single
+# non-cursor rule is what keeps a newly added adapter covered by default.
+if [ "$HARNESS" != cursor ] && [ "${RAW_LAUNCH:-0}" -eq 0 ]; then
+  LAUNCH="env -u CURSOR_AGENT $LAUNCH"
+fi
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
