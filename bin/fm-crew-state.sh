@@ -26,8 +26,10 @@
 #      branch whose head was rewritten or diverged must not be attributed.
 #      A run matches when its head equals the worktree HEAD, or the worktree HEAD
 #      is an ancestor of the run head (pipeline fix commits advanced the run on
-#      the same line of history). Local work that advanced past the run head, or
-#      diverged from it, invalidates attribution.
+#      the same line of history). An active exact-branch run with a nonempty head
+#      that is not locally resolvable is also attributed: pipeline custody can
+#      advance the head in the gate repository. Local work that advanced past the
+#      run head, or diverged from it, invalidates attribution.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -374,6 +376,24 @@ nm_run_head_matches_worktree() {
   fm_nm_head_matches_worktree "$WT" "$run_head"
 }
 
+# Pipeline custody can move an active run's head into its gate repository before
+# that commit is available in this worktree. Missing heads stay rejected, while
+# resolvable rewritten/diverged heads remain fail-closed through the matcher.
+nm_active_unresolvable_run_head() {
+  local run_head status outcome
+  run_head=$(strip_quotes "$(nm_field head)")
+  [ -n "$run_head" ] || return 1
+  status=$(strip_quotes "$(nm_field status)")
+  outcome=$(strip_quotes "$(nm_field outcome)")
+  [ -z "$outcome" ] || return 1
+  case "$status" in
+    running|fixing|ci|awaiting_approval|fix_review) ;;
+    *) return 1 ;;
+  esac
+  git -C "$WT" rev-parse --verify "${run_head}^{commit}" >/dev/null 2>&1 && return 1
+  return 0
+}
+
 # Coarse runs-list rows are "<status> <branch> <short-sha> ...". 0 if the short
 # sha for this branch row matches the worktree head under the same rules as
 # nm_run_head_matches_worktree (equal, or local is ancestor of run tip).
@@ -394,7 +414,8 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
-    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] && nm_run_head_matches_worktree; then
+    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] && \
+      { nm_run_head_matches_worktree || nm_active_unresolvable_run_head; }; then
       HAVE_RUN=1
     else
       # The active-or-most-recent run is for another branch, or same branch with

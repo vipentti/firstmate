@@ -1290,6 +1290,27 @@ test_local_advanced_past_run_head_invalidates() {
   pass "local work advanced past run head invalidates attribution"
 }
 
+# Pipeline custody can advance an active run head in the gate repository before
+# that commit is available in the crew worktree. Exact-branch attribution must
+# keep the live gate state authoritative instead of falling back to an older run.
+test_active_pipeline_unresolvable_head_remains_current() {
+  reset_fakes
+  local d out
+  d=$(new_case pipeline-unresolvable-head)
+  make_repo_on_branch "$d/wt" fm/feat-pipeline-gate
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/gate.meta" "window=fm:fm-gate" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_RUN_HEAD=666eadd9
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-pipeline-gate)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" gate
+  out=$(run_crew_state "$d" gate)
+  assert_contains "$out" "source: run-step" "pipeline-owned unresolvable head uses run-step"
+  assert_contains "$out" "state: parked" "pipeline-owned gate remains parked"
+  assert_contains "$out" "parked at review" "pipeline-owned gate detail survives attribution"
+  pass "active pipeline run with unresolvable gate head remains current"
+}
+
 test_missing_run_head_falls_back_to_current_state() {
   reset_fakes
   local d out
@@ -1357,6 +1378,7 @@ test_usage_error
 test_historical_same_branch_rewritten_head_not_current
 test_active_run_descendant_fix_head_remains_current
 test_local_advanced_past_run_head_invalidates
+test_active_pipeline_unresolvable_head_remains_current
 test_missing_run_head_falls_back_to_current_state
 
 echo "all fm-crew-state tests passed"
